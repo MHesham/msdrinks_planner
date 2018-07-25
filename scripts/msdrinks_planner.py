@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 import rospy
 from sensor_msgs.msg import Image
-from msdrinks_planner_msgs.msg import ItemRequest
+from msdrinks_planner_msgs.srv import IssueRequest
+from msdrinks_planner_msgs.srv import IssueRequestRequest
+from msdrinks_planner_msgs.srv import IssueRequestResponse
+from msdrinks_planner_msgs.srv import GetRequestStatus
+from msdrinks_planner_msgs.srv import GetRequestStatusResponse
 from object_detection_msgs.msg import DetectedObject
 from object_detection_msgs.msg import DetectedObjectsArray
 from geometry_msgs.msg import Twist
@@ -10,7 +14,7 @@ from apriltags2_ros.msg import AprilTagDetectionArray
 
 
 class MsDrinksPlanner:
-    STATE_INIT = 'init'
+    STATE_IDLE = 'idle'
     STATE_REQUEST_ARRIVED = 'req-arrived'
     STATE_FIND_REQUESTOR = 'find-req'
     STATE_FIND_PROVIDER = 'find-prov'
@@ -18,20 +22,19 @@ class MsDrinksPlanner:
     STATE_REACH_REQUESTOR = 'reach-prov'
     STATE_STOCK_REFILL = 'stock-refill'
     STATE_DELIVER = 'deliver'
-    STATE_COMPLETE = 'complete'
+    STATE_FULFILLED = 'fulfilled'
 
     PROVIDER_DEFAULT_ID = 0
 
     def __init__(self):
-        self.state = self.STATE_INIT
-        self.detected_items = None
-        self.active_request = None
+        rospy.loginfo('msdrinks planner starting...')
+        self.state = self.STATE_IDLE
         self.stock = {}
         self.provider_id = self.PROVIDER_DEFAULT_ID
+        self.active_request = None
+        self.detected_items = None
         self.tag_detections = None
         rospy.on_shutdown(self.on_shutdown)
-        rospy.Subscriber('/drinks_cmd', ItemRequest,
-                         self.on_request, queue_size=1)
         rospy.Subscriber('/detected_objects/boxes', DetectedObjectsArray,
                          self.on_stock_detected_items, queue_size=1)
         rospy.Subscriber('/tag_detections', AprilTagDetectionArray,
@@ -39,6 +42,11 @@ class MsDrinksPlanner:
 
         self.cmd_vel_pub = rospy.Publisher(
             'cmd_vel_mux/input/navi', Twist, queue_size=10)
+
+        self.issue_req_srv = rospy.Service(
+            'IssueRequest', IssueRequest, self.on_issue_request)
+        self.get_req_status_srv = rospy.Service(
+            'GetRequestStatus', GetRequestStatus, self.on_get_request_status)
 
     def on_stock_detected_items(self, detected_items):
         self.detected_items = detected_items.objects
@@ -48,22 +56,42 @@ class MsDrinksPlanner:
         self.tag_detections = tag_detections.detections
         rospy.loginfo('can see {} tags'.format(len(self.tag_detections)))
 
-    def on_request(self, request):
-        rospy.loginfo('received {} request from entity {}'.format(
-            request.item_name, request.requestor_id))
+    def on_issue_request(self, srv_request):
+        rospy.loginfo('received {} request from requestor {}'.format(
+            srv_request.item_name, srv_request.requestor_id))
+        if self.state != self.STATE_IDLE:
+            rospy.logerr(
+                'ignoring request, another request is already in progress')
+            return False
+        elif self.detected_items is None:
+            rospy.logerr('stock object detection is not up and running')
+            return False
+        elif self.tag_detections is None:
+            rospy.logerr('tag detection is not up and running')
+            return False
 
-        assert(self.active_request == None)
-        self.active_request = request
+        self.active_request = srv_request
         self.state = self.STATE_REQUEST_ARRIVED
-        while self.state != self.STATE_COMPLETE:
-            self.update()
-        self.active_request = None
-        rospy.loginfo('request fulfilled')
+        return True
+
+    def on_get_request_status(self, srv_request):
+        return GetRequestStatusResponse.STATUS_INVALID
+
+    def is_planner_ready(self):
+        if (self.detected_items is None) or (self.tag_detections is None):
+            return False
+        return True
+
+    def spin(self):
+        rate = rospy.Rate(20)
+        while not rospy.is_shutdown():
+            if self.is_planner_ready() and (self.state != self.STATE_IDLE):
+                self.update()
+            rate.sleep()
 
     def update(self):
-        rospy.loginfo('current state is {}'.format(self.state))
         previous_state = self.state
-
+        assert(self.state != self.STATE_IDLE)
         if self.state == self.STATE_REQUEST_ARRIVED:
             self.update_req_arrived()
         elif self.state == self.STATE_FIND_REQUESTOR:
@@ -78,6 +106,8 @@ class MsDrinksPlanner:
             self.update_stock_refill()
         elif self.state == self.STATE_DELIVER:
             self.update_deliver()
+        elif self.state == self.STATE_FULFILLED:
+            self.update_fulfilled()
 
         if previous_state != self.state:
             rospy.loginfo(
@@ -118,15 +148,20 @@ class MsDrinksPlanner:
 
     def update_deliver(self):
         if not self.is_item_in_stock():
-            self.state = self.STATE_COMPLETE
+            self.state = self.STATE_FULFILLED
+
+    def update_fulfilled(self):
+        self.state = self.STATE_IDLE
 
     def is_item_in_stock(self):
-        for item in self.detected_items.objects:
+        assert(self.detected_items is not None)
+        for item in self.detected_items:
             if item.label == self.active_request.item_name:
                 return True
         return False
 
     def is_tag_found(self, tag_id):
+        assert(self.detected_items is not None)
         for tag in self.tag_detections:
             if tag[0].id == tag_id:
                 return True
@@ -141,4 +176,4 @@ class MsDrinksPlanner:
 if __name__ == '__main__':
     rospy.init_node('msdrinks_planner', anonymous=True)
     planner = MsDrinksPlanner()
-    rospy.spin()
+    planner.spin()
