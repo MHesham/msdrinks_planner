@@ -11,6 +11,9 @@ from object_detection_msgs.msg import DetectedObjectsArray
 from geometry_msgs.msg import Twist
 from apriltags2_ros.msg import AprilTagDetection
 from apriltags2_ros.msg import AprilTagDetectionArray
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+import actionlib
+from actionlib_msgs.msg import *
 
 
 class MsDrinksPlanner:
@@ -18,19 +21,23 @@ class MsDrinksPlanner:
     STATE_REQUEST_ARRIVED = 'req-arrived'
     STATE_FIND_REQUESTOR = 'find-req'
     STATE_FIND_PROVIDER = 'find-prov'
+    STATE_FIND_STATION = 'find-stn'
     STATE_REACH_PROVIDER = 'reach-prov'
     STATE_REACH_REQUESTOR = 'reach-prov'
     STATE_STOCK_REFILL = 'stock-refill'
     STATE_DELIVER = 'deliver'
     STATE_FULFILLED = 'fulfilled'
+    STATE_REACH_STATION = 'reach-stn'
 
     PROVIDER_DEFAULT_ID = 0
+    STATION_DEFAULT_ID = 1
 
     def __init__(self):
         rospy.loginfo('msdrinks planner starting...')
         self.state = self.STATE_IDLE
         self.stock = {}
         self.provider_id = self.PROVIDER_DEFAULT_ID
+        self.station_id = self.PROVIDER_DEFAULT_ID
         self.active_request = None
         self.detected_items = None
         self.tag_detections = None
@@ -42,6 +49,12 @@ class MsDrinksPlanner:
 
         self.cmd_vel_pub = rospy.Publisher(
             'cmd_vel_mux/input/navi', Twist, queue_size=10)
+
+        self.move_base = actionlib.SimpleActionClient(
+            "move_base", MoveBaseAction)
+        rospy.loginfo("wait for the action server to come up")
+        # allow up to 5 seconds for the action server to come up
+        self.move_base.wait_for_server(rospy.Duration(5))
 
         self.issue_req_srv = rospy.Service(
             'IssueRequest', IssueRequest, self.on_issue_request)
@@ -98,10 +111,14 @@ class MsDrinksPlanner:
             self.update_find_req()
         elif self.state == self.STATE_FIND_PROVIDER:
             self.update_find_prov()
+        elif self.state == self.STATE_FIND_STATION:
+            self.update_find_station()
         elif self.state == self.STATE_REACH_PROVIDER:
             self.update_reach_prov()
         elif self.state == self.STATE_REACH_REQUESTOR:
             self.update_reach_req()
+        elif self.state == self.STATE_REACH_STATION:
+            self.update_reach_station()
         elif self.state == self.STATE_STOCK_REFILL:
             self.update_stock_refill()
         elif self.state == self.STATE_DELIVER:
@@ -136,11 +153,47 @@ class MsDrinksPlanner:
         self.find_tag_by_id(self.provider_id)
         self.state = self.STATE_REACH_REQUESTOR
 
+    def update_find_station(self):
+        self.find_tag_by_id(self.station_id)
+        self.state = self.STATE_REACH_STATION
+
     def update_reach_req(self):
-        raise rospy.ROSException()
+        pose = None
+        for tag in self.tag_detections:
+            if tag[0].id == self.active_request.requestor_id:
+                pose = tag[0].pose.pose
+                break
+        if pose is None:
+            self.state = self.STATE_REQUEST_ARRIVED
+        else:
+            if self.go_to(pose):
+                self.state = self.STATE_DELIVER
+            else:
+                self.state = self.STATE_REQUEST_ARRIVED
 
     def update_reach_prov(self):
-        raise rospy.ROSException()
+        pose = None
+        for tag in self.tag_detections:
+            if tag[0].id == self.provider_id:
+                pose = tag[0].pose.pose
+                break
+        if pose is None:
+            self.state = self.STATE_REQUEST_ARRIVED
+        else:
+            if self.go_to(pose):
+                self.state = self.STATE_STOCK_REFILL
+            else:
+                self.state = self.STATE_REQUEST_ARRIVED
+
+    def update_reach_station(self):
+        pose = None
+        for tag in self.tag_detections:
+            if tag[0].id == self.station_id:
+                pose = tag[0].pose.pose
+                break
+        if pose is not None:
+            if self.go_to(pose):
+                self.state = self.STATE_IDLE
 
     def update_stock_refill(self):
         if self.is_item_in_stock():
@@ -152,6 +205,30 @@ class MsDrinksPlanner:
 
     def update_fulfilled(self):
         self.state = self.STATE_IDLE
+
+    def go_to(self, pose):
+        goal = MoveBaseGoal()
+        goal.target_pose.header.frame_id = 'base_link'
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.pose = pose
+
+        # start moving
+        self.move_base.send_goal(goal)
+
+        # allow TurtleBot up to 60 seconds to complete task
+        success = self.move_base.wait_for_result(rospy.Duration(60))
+
+        if not success:
+            self.move_base.cancel_goal()
+            rospy.logwarn(
+                "The base failed to move forward 3 meters for some reason")
+            return False
+        else:
+            state = self.move_base.get_state()
+            if state == GoalStatus.SUCCEEDED:
+                rospy.loginfo(
+                    "Hooray, the base moved arrived at {}".format(pos))
+            return True
 
     def is_item_in_stock(self):
         assert(self.detected_items is not None)
