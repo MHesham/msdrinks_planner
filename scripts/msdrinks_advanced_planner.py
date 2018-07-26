@@ -34,6 +34,7 @@ class GoToPose():
         self.move_base.wait_for_server(rospy.Duration(5))
 
     def goto(self, pos):
+        rospy.loginfo('going to ({},{})'.format(pos['x'], pos['y']))
         quat = {'r1': 0.000, 'r2': 0.000, 'r3': 0.000, 'r4': 1.000}
         # Send a goal
         self.goal_sent = True
@@ -72,7 +73,7 @@ class MsDrinksPlanner:
     STATE_IDLE = 'idle'
     STATE_REQUEST_ARRIVED = 'req-arrived'
     STATE_REACH_PROVIDER = 'reach-prov'
-    STATE_REACH_REQUESTOR = 'reach-prov'
+    STATE_REACH_REQUESTOR = 'reach-req'
     STATE_STOCK_REFILL = 'stock-refill'
     STATE_DELIVER = 'deliver'
     STATE_FULFILLED = 'fulfilled'
@@ -96,10 +97,22 @@ class MsDrinksPlanner:
             'IssueRequest', IssueRequest, self.on_issue_request)
         self.get_req_status_srv = rospy.Service(
             'GetRequestStatus', GetRequestStatus, self.on_get_request_status)
-        self.station_pos = {'x': 0.1, 'y': 0.0264}
+        self.station_pos = {'x': 1.02, 'y': -0.408}
         self.provider_pos = {'x': -2.27, 'y': -1.43}
         self.requestor_pos = [
             {'x': 2.88, 'y': -4.39}, {'x': 0.537, 'y': -6.12}]
+        
+        self.cmd_vel_pub = rospy.Publisher(
+            'cmd_vel_mux/input/navi', Twist, queue_size=10)
+
+        initial_cmd = Twist()
+        initial_cmd.linear.x = 0.3
+        initial_cmd.linear.y = 0.2
+        rate = rospy.Rate(10)
+        for x in range(0, 30):
+            self.cmd_vel_pub.publish(initial_cmd)
+            rate.sleep()
+        self.cmd_vel_pub.publish(Twist())
 
     def on_stock_detected_items(self, detected_items):
         self.detected_items = detected_items.objects
@@ -162,9 +175,9 @@ class MsDrinksPlanner:
 
     def update_req_arrived(self):
         if self.is_item_in_stock():
-            self.state = self.STATE_REACH_PROVIDER
-        else:
             self.state = self.STATE_REACH_REQUESTOR
+        else:
+            self.state = self.STATE_REACH_PROVIDER
 
     def update_reach_req(self):
         success = self.navigator.goto(
@@ -190,9 +203,6 @@ class MsDrinksPlanner:
         if success:
             rospy.loginfo("Hooray, reached the stations pose")
             self.state = self.STATE_IDLE
-        else:
-            rospy.loginfo("The base failed to reach the station pose")
-            self.state = self.STATE_REQUEST_ARRIVED
 
     def update_stock_refill(self):
         if self.is_item_in_stock():
@@ -208,7 +218,7 @@ class MsDrinksPlanner:
     def is_item_in_stock(self):
         assert(self.detected_items is not None)
         for item in self.detected_items:
-            if item.label == self.active_request.item_name:
+            if item.label.lower() == self.active_request.item_name.lower():
                 return True
         return False
 
